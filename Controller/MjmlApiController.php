@@ -4,289 +4,422 @@ declare(strict_types=1);
 
 namespace MauticPlugin\MauticMjmlApiBundle\Controller;
 
+use Doctrine\Persistence\ManagerRegistry;
+use Doctrine\Persistence\ObjectManager;
 use Mautic\ApiBundle\Controller\CommonApiController;
+use Mautic\ApiBundle\Helper\EntityResultHelper;
+use Mautic\CoreBundle\Factory\ModelFactory;
+use Mautic\CoreBundle\Helper\AppVersion;
+use Mautic\CoreBundle\Helper\CoreParametersHelper;
+use Mautic\CoreBundle\Security\Permissions\CorePermissions;
+use Mautic\CoreBundle\Translation\Translator;
 use Mautic\EmailBundle\Entity\Email;
+use Mautic\EmailBundle\Model\EmailModel;
+use Mautic\LeadBundle\Entity\LeadList;
+use Mautic\LeadBundle\Model\ListModel;
 use MauticPlugin\GrapesJsBuilderBundle\Entity\GrapesJsBuilder;
 use MauticPlugin\MauticMjmlApiBundle\Helper\MjmlCompiler;
+use Symfony\Component\EventDispatcher\EventDispatcherInterface;
+use Symfony\Component\Form\FormFactoryInterface;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\RequestStack;
 use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\Routing\RouterInterface;
 
 /**
- * MJML API Controller
- * 
- * Handles MJML email creation and editing via API
+ * Creates and updates segment emails from MJML.
+ *
+ * Compiled HTML is stored on the email. The original MJML is stored on the
+ * GrapesJS builder row so the email stays editable in the visual builder.
+ *
+ * @extends CommonApiController<Email>
  */
 class MjmlApiController extends CommonApiController
 {
     /**
-     * Create new email with MJML content
-     * 
-     * POST /api/emails/mjml/new
-     * 
-     * Required fields:
-     * - name: Email name
-     * - subject: Email subject
-     * - mjml: MJML source code
-     * - lists: Array of list IDs
-     * 
-     * Optional fields:
-     * - template: Template name (default: null/blank)
-     * - fromAddress, fromName, replyToAddress
-     * - isPublished, language, emailType
+     * Dates without an offset are interpreted in this timezone.
+     * ISO-8601 values that already include an offset keep that offset.
      */
-    public function createEmailAction(Request $request)
+    private const TIMEZONE = 'Europe/Ljubljana';
+
+    /**
+     * @param ModelFactory<Email> $modelFactory
+     */
+    public function __construct(
+        CorePermissions $security,
+        Translator $translator,
+        EntityResultHelper $entityResultHelper,
+        RouterInterface $router,
+        FormFactoryInterface $formFactory,
+        AppVersion $appVersion,
+        RequestStack $requestStack,
+        ManagerRegistry $doctrine,
+        ModelFactory $modelFactory,
+        EventDispatcherInterface $dispatcher,
+        CoreParametersHelper $coreParametersHelper,
+        private readonly EmailModel $emailModel,
+        private readonly ListModel $listModel,
+        private readonly MjmlCompiler $mjmlCompiler,
+    ) {
+        $this->model            = $emailModel;
+        $this->entityClass      = Email::class;
+        $this->entityNameOne    = 'email';
+        $this->entityNameMulti  = 'emails';
+        $this->serializerGroups = [
+            'emailDetails',
+            'categoryList',
+            'publishDetails',
+            'assetList',
+            'formList',
+            'leadListList',
+        ];
+
+        parent::__construct(
+            $security,
+            $translator,
+            $entityResultHelper,
+            $router,
+            $formFactory,
+            $appVersion,
+            $requestStack,
+            $doctrine,
+            $modelFactory,
+            $dispatcher,
+            $coreParametersHelper,
+        );
+    }
+
+    /**
+     * POST /api/emails/mjml/new
+     */
+    public function createEmailAction(Request $request): Response
     {
-        $data = $request->request->all();
-        
-        // Validate required fields
+        $data = $this->getPayload($request);
+        if ($data instanceof Response) {
+            return $data;
+        }
+
         if (empty($data['name'])) {
             return $this->returnError('name is required', Response::HTTP_BAD_REQUEST);
         }
-        
+
         if (empty($data['subject'])) {
             return $this->returnError('subject is required', Response::HTTP_BAD_REQUEST);
         }
-        
-        if (empty($data['mjml'])) {
+
+        if (empty($data['mjml']) || !is_string($data['mjml'])) {
             return $this->returnError('mjml is required', Response::HTTP_BAD_REQUEST);
         }
-        
+
         if (empty($data['lists']) || !is_array($data['lists'])) {
             return $this->returnError('lists array is required', Response::HTTP_BAD_REQUEST);
         }
-        
+
+        $email = new Email();
+
+        $denied = $this->denyUnless($this->checkEntityAccess($email, 'create'));
+        if ($denied instanceof Response) {
+            return $denied;
+        }
+
+        $isPublished = $this->toBool($data['isPublished'] ?? false);
+        if ($isPublished) {
+            $denied = $this->denyUnless($this->checkEntityAccess($email, 'publish'));
+            if ($denied instanceof Response) {
+                return $denied;
+            }
+        }
+
         try {
-            $emailModel = $this->getModel('email');
-            $em = $this->getDoctrine()->getManager();
-            
-            // Compile MJML to HTML
-            $mjmlCompiler = new MjmlCompiler();
-            $compiledHtml = $mjmlCompiler->compile($data['mjml']);
-            
-            if (!$compiledHtml) {
+            $compiledHtml = $this->mjmlCompiler->compile($data['mjml']);
+            if (!is_string($compiledHtml) || '' === $compiledHtml) {
                 return $this->returnError('Failed to compile MJML', Response::HTTP_BAD_REQUEST);
             }
-            
-            // Create email entity
-            $email = new Email();
-            $email->setName($data['name']);
-            $email->setSubject($data['subject']);
+
+            $email->setName((string) $data['name']);
+            $email->setSubject((string) $data['subject']);
             $email->setCustomHtml($compiledHtml);
-            $email->setEmailType($data['emailType'] ?? 'list');
-            $email->setIsPublished($data['isPublished'] ?? false);
-            $email->setLanguage($data['language'] ?? 'en');
-            
-            // Set template - use 'blank' for custom HTML emails
-            // When using customHtml, Mautic needs 'blank' template to render properly
-            if (!empty($data['template'])) {
-                $email->setTemplate($data['template']);
-            } else {
-                // Default to 'blank' template for custom HTML
-                $email->setTemplate('blank');
-            }
-            
-            // Set sender info
-            if (!empty($data['fromAddress'])) {
-                $email->setFromAddress($data['fromAddress']);
-            }
-            if (!empty($data['fromName'])) {
-                $email->setFromName($data['fromName']);
-            }
-            if (!empty($data['replyToAddress'])) {
-                $email->setReplyToAddress($data['replyToAddress']);
-            }
-            
-            // Handle Publish Up/Down
-            // Določimo časovni pas Ljubljana
-            $timezone = new \DateTimeZone('Europe/Ljubljana');
-            
-            if (!empty($data['publishUp'])) {
-                try {
-                    $email->setPublishUp(new \DateTime($data['publishUp'], $timezone));
-                } catch (\Exception $e) {
-                    // Ignore invalid date format
-                }
-            }
-            if (!empty($data['publishDown'])) {
-                try {
-                    $email->setPublishDown(new \DateTime($data['publishDown'], $timezone));
-                } catch (\Exception $e) {
-                    // Ignore invalid date format
-                }
-            }
-            
-            // Handle UTM Tags
-            if (isset($data['utmTags']) && is_array($data['utmTags'])) {
-                $email->setUtmTags($data['utmTags']);
-            }
-            
-            // Add lists to email BEFORE saving
-            $listModel = $this->getModel('lead.list');
-            foreach ($data['lists'] as $listId) {
-                $list = $listModel->getEntity($listId);
-                if ($list) {
-                    $email->addList($list);
-                }
-            }
-            
-            // Save email with lists
-            $emailModel->saveEntity($email);
-            
-            // Save MJML source in GrapesJS builder table
-            // This ensures the email is editable in the visual builder
-            $grapesJsBuilder = new GrapesJsBuilder();
-            $grapesJsBuilder->setEmail($email);
-            $grapesJsBuilder->setCustomMjml($data['mjml']);
-            $em->persist($grapesJsBuilder);
-            $em->flush();
-            
-            // Return response
-            $view = $this->view(
-                [
-                    'email' => $emailModel->getEntity($email->getId()),
-                ],
-                Response::HTTP_CREATED
-            );
-            
-            return $this->handleView($view);
-            
-        } catch (\Exception $e) {
+            $email->setEmailType(is_string($data['emailType'] ?? null) && '' !== $data['emailType'] ? $data['emailType'] : 'list');
+            $email->setIsPublished($isPublished);
+            $email->setLanguage(is_string($data['language'] ?? null) && '' !== $data['language'] ? $data['language'] : 'en');
+            $email->setTemplate(is_string($data['template'] ?? null) && '' !== $data['template'] ? $data['template'] : 'blank');
+
+            $this->applySender($email, $data, false);
+            $this->applyPublishWindow($email, $data, false);
+            $this->applyUtmTags($email, $data);
+            $this->applyLists($email, $data['lists']);
+
+            $this->emailModel->saveEntity($email);
+            $this->saveMjmlSource($email, $data['mjml']);
+
+            return $this->emailResponse($this->emailModel->getEntity($email->getId()), Response::HTTP_CREATED);
+        } catch (\Throwable $e) {
             return $this->returnError($e->getMessage(), Response::HTTP_INTERNAL_SERVER_ERROR);
         }
     }
-    
+
     /**
-     * Edit existing email with MJML content
-     * 
      * PATCH /api/emails/mjml/{id}/edit
      */
-    public function editEmailAction(Request $request, $id)
+    public function editEmailAction(Request $request, string $id): Response
     {
-        $data = $request->request->all();
-        
+        $data = $this->getPayload($request);
+        if ($data instanceof Response) {
+            return $data;
+        }
+
         try {
-            $emailModel = $this->getModel('email');
-            $em = $this->getDoctrine()->getManager();
-            
-            // Get existing email
-            $email = $emailModel->getEntity($id);
-            if (!$email) {
+            $email = $this->emailModel->getEntity((int) $id);
+            if (!$email instanceof Email) {
                 return $this->notFound();
             }
-            
-            // Update MJML if provided
-            if (!empty($data['mjml'])) {
-                // Compile MJML to HTML
-                $mjmlCompiler = new MjmlCompiler();
-                $compiledHtml = $mjmlCompiler->compile($data['mjml']);
-                
-                if (!$compiledHtml) {
+
+            $denied = $this->denyUnless($this->checkEntityAccess($email, 'edit'));
+            if ($denied instanceof Response) {
+                return $denied;
+            }
+
+            if (array_key_exists('isPublished', $data) && $this->toBool($data['isPublished'])) {
+                $denied = $this->denyUnless($this->checkEntityAccess($email, 'publish'));
+                if ($denied instanceof Response) {
+                    return $denied;
+                }
+            }
+
+            if (isset($data['mjml'])) {
+                if (!is_string($data['mjml']) || '' === $data['mjml']) {
+                    return $this->returnError('mjml must be a non-empty string', Response::HTTP_BAD_REQUEST);
+                }
+
+                $compiledHtml = $this->mjmlCompiler->compile($data['mjml']);
+                if (!is_string($compiledHtml) || '' === $compiledHtml) {
                     return $this->returnError('Failed to compile MJML', Response::HTTP_BAD_REQUEST);
                 }
-                
+
                 $email->setCustomHtml($compiledHtml);
-                
-                // Update MJML source in GrapesJS builder table
-                $grapesJsRepo = $em->getRepository(GrapesJsBuilder::class);
-                $grapesJsBuilder = $grapesJsRepo->findOneBy(['email' => $email]);
-                
-                if (!$grapesJsBuilder) {
-                    $grapesJsBuilder = new GrapesJsBuilder();
-                    $grapesJsBuilder->setEmail($email);
-                }
-                
-                $grapesJsBuilder->setCustomMjml($data['mjml']);
-                $em->persist($grapesJsBuilder);
             }
-            
-            // Update other fields if provided
+
             if (isset($data['name'])) {
-                $email->setName($data['name']);
+                $email->setName((string) $data['name']);
             }
             if (isset($data['subject'])) {
-                $email->setSubject($data['subject']);
+                $email->setSubject((string) $data['subject']);
             }
-            if (isset($data['isPublished'])) {
-                $email->setIsPublished($data['isPublished']);
+            if (array_key_exists('isPublished', $data)) {
+                $email->setIsPublished($this->toBool($data['isPublished']));
             }
-            
-            // Update Publish Dates
-            // Določimo časovni pas Ljubljana
-            $timezone = new \DateTimeZone('Europe/Ljubljana');
-            
-            if (array_key_exists('publishUp', $data)) {
-                if (!empty($data['publishUp'])) {
-                    try {
-                        $email->setPublishUp(new \DateTime($data['publishUp'], $timezone));
-                    } catch (\Exception $e) {
-                        // Ignore invalid date format
-                    }
-                } else {
-                    $email->setPublishUp(null);
+
+            $this->applySender($email, $data, true);
+            $this->applyPublishWindow($email, $data, true);
+            $this->applyUtmTags($email, $data);
+
+            if (isset($data['lists'])) {
+                if (!is_array($data['lists'])) {
+                    return $this->returnError('lists must be an array', Response::HTTP_BAD_REQUEST);
                 }
-            }
-            if (array_key_exists('publishDown', $data)) {
-                if (!empty($data['publishDown'])) {
-                    try {
-                        $email->setPublishDown(new \DateTime($data['publishDown'], $timezone));
-                    } catch (\Exception $e) {
-                        // Ignore invalid date format
-                    }
-                } else {
-                    $email->setPublishDown(null);
-                }
-            }
-            
-            // Update UTM Tags
-            if (isset($data['utmTags']) && is_array($data['utmTags'])) {
-                $email->setUtmTags($data['utmTags']);
-            }
-            
-            // Update Sender Info
-            if (isset($data['fromName'])) {
-                $email->setFromName($data['fromName']);
-            }
-            if (isset($data['fromAddress'])) {
-                $email->setFromAddress($data['fromAddress']);
-            }
-            if (isset($data['replyToAddress'])) {
-                $email->setReplyToAddress($data['replyToAddress']);
-            }
-            
-            // Update lists if provided
-            if (isset($data['lists']) && is_array($data['lists'])) {
-                $listModel = $this->getModel('lead.list');
-                
-                // Remove existing lists
-                foreach ($email->getLists() as $list) {
+
+                foreach ($email->getLists()->toArray() as $list) {
                     $email->removeList($list);
                 }
-                
-                // Add new lists
-                foreach ($data['lists'] as $listId) {
-                    $list = $listModel->getEntity($listId);
-                    if ($list) {
-                        $email->addList($list);
-                    }
-                }
+
+                $this->applyLists($email, $data['lists']);
             }
-            
-            // Save changes
-            $emailModel->saveEntity($email);
-            $em->flush();
-            
-            // Return response
-            $view = $this->view(
-                [
-                    'email' => $emailModel->getEntity($email->getId()),
-                ],
-                Response::HTTP_OK
-            );
-            
-            return $this->handleView($view);
-            
-        } catch (\Exception $e) {
+
+            $this->emailModel->saveEntity($email);
+
+            if (isset($data['mjml']) && is_string($data['mjml'])) {
+                $this->saveMjmlSource($email, $data['mjml']);
+            }
+
+            return $this->emailResponse($this->emailModel->getEntity($email->getId()), Response::HTTP_OK);
+        } catch (\Throwable $e) {
             return $this->returnError($e->getMessage(), Response::HTTP_INTERNAL_SERVER_ERROR);
         }
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     */
+    private function applySender(Email $email, array $data, bool $allowEmpty): void
+    {
+        foreach (['fromAddress' => 'setFromAddress', 'fromName' => 'setFromName', 'replyToAddress' => 'setReplyToAddress'] as $field => $setter) {
+            if (!array_key_exists($field, $data)) {
+                continue;
+            }
+
+            $value = $data[$field];
+            if (!is_string($value)) {
+                continue;
+            }
+
+            if (!$allowEmpty && '' === $value) {
+                continue;
+            }
+
+            $email->{$setter}($value);
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     */
+    private function applyPublishWindow(Email $email, array $data, bool $allowClear): void
+    {
+        $timezone = new \DateTimeZone(self::TIMEZONE);
+
+        foreach (['publishUp' => 'setPublishUp', 'publishDown' => 'setPublishDown'] as $field => $setter) {
+            if ($allowClear) {
+                if (!array_key_exists($field, $data)) {
+                    continue;
+                }
+            } elseif (empty($data[$field])) {
+                continue;
+            }
+
+            $value = $data[$field] ?? null;
+            if (!is_string($value) || '' === $value) {
+                if ($allowClear) {
+                    $email->{$setter}(null);
+                }
+
+                continue;
+            }
+
+            try {
+                $email->{$setter}(new \DateTime($value, $timezone));
+            } catch (\Exception) {
+                // Ignore invalid date format, matching the previous API behaviour.
+            }
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     */
+    private function applyUtmTags(Email $email, array $data): void
+    {
+        if (isset($data['utmTags']) && is_array($data['utmTags'])) {
+            $email->setUtmTags($data['utmTags']);
+        }
+    }
+
+    /**
+     * @param array<mixed> $listIds
+     */
+    private function applyLists(Email $email, array $listIds): void
+    {
+        foreach ($listIds as $listId) {
+            $normalizedId = $this->normalizeId($listId);
+            if (null === $normalizedId) {
+                continue;
+            }
+
+            $list = $this->listModel->getEntity($normalizedId);
+            if ($list instanceof LeadList) {
+                $email->addList($list);
+            }
+        }
+    }
+
+    private function saveMjmlSource(Email $email, string $mjml): void
+    {
+        if (!class_exists(GrapesJsBuilder::class)) {
+            throw new \RuntimeException('The GrapesJS Builder plugin must be installed to store MJML source.');
+        }
+
+        $em = $this->entityManager();
+        $grapesJsBuilder = $em->getRepository(GrapesJsBuilder::class)->findOneBy(['email' => $email]);
+
+        if (!$grapesJsBuilder instanceof GrapesJsBuilder) {
+            $grapesJsBuilder = new GrapesJsBuilder();
+            $grapesJsBuilder->setEmail($email);
+        }
+
+        $grapesJsBuilder->setCustomMjml($mjml);
+        $em->persist($grapesJsBuilder);
+        $em->flush();
+    }
+
+    private function emailResponse(?Email $email, int $status): Response
+    {
+        if (!$email instanceof Email) {
+            return $this->returnError('Email could not be loaded after save.', Response::HTTP_INTERNAL_SERVER_ERROR);
+        }
+
+        $view = $this->view(['email' => $email], $status);
+        $this->setSerializationContext($view);
+
+        return $this->handleView($view);
+    }
+
+    /**
+     * FOSRest normally decodes JSON into the request bag. Fall back to the raw
+     * body when that listener did not run.
+     *
+     * @return array<string, mixed>|Response
+     */
+    private function getPayload(Request $request): array|Response
+    {
+        $data = $request->request->all();
+        if ([] !== $data) {
+            return $data;
+        }
+
+        $content = $request->getContent();
+        if (!is_string($content) || '' === trim($content)) {
+            return [];
+        }
+
+        try {
+            $decoded = json_decode($content, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException) {
+            return $this->returnError('Request body must be valid JSON.', Response::HTTP_BAD_REQUEST);
+        }
+
+        if (!is_array($decoded)) {
+            return $this->returnError('Request body must be a JSON object.', Response::HTTP_BAD_REQUEST);
+        }
+
+        return $decoded;
+    }
+
+    private function denyUnless(mixed $access): ?Response
+    {
+        if ($access instanceof Response) {
+            return $access;
+        }
+
+        if (true !== $access) {
+            return $this->accessDenied();
+        }
+
+        return null;
+    }
+
+    private function normalizeId(mixed $value): ?int
+    {
+        if (is_int($value)) {
+            return $value > 0 ? $value : null;
+        }
+
+        if (is_string($value) && 1 === preg_match('/^[1-9]\d*$/', $value)) {
+            return (int) $value;
+        }
+
+        return null;
+    }
+
+    private function toBool(mixed $value): bool
+    {
+        if (is_string($value)) {
+            return in_array(strtolower(trim($value)), ['1', 'true', 'yes', 'on'], true);
+        }
+
+        return (bool) $value;
+    }
+
+    private function entityManager(): ObjectManager
+    {
+        return $this->doctrine->getManager();
     }
 }

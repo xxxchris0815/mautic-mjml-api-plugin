@@ -14,8 +14,10 @@ This plugin solves a common problem when automating email creation in Mautic: it
 
 ## 📋 Requirements
 
-- **Mautic**: Version 4.x or 5.x
-- **Mautic GrapesJS Builder Bundle**: This is the standard builder in recent Mautic versions.
+- **Mautic**: 7.x (tested against the 7.x plugin API: Symfony 7.4, PHP 8.2+)
+- **PHP**: 8.2 or newer
+- **Mautic GrapesJS Builder**: Bundled with Mautic 7. Install and enable it under Settings → Plugins. The MJML source is stored in its `bundle_grapesjsbuilder` table.
+- **API permissions**: The API user needs `email:emails:create` to create emails and `email:emails:editown` or `editother` to update them. Publishing (`isPublished: true`) also requires the matching publish permission.
 - **MJML** (Recommended):
   - For the best results, `mjml` should be installed globally on your server via Node.js.
   - Command: `npm install -g mjml`
@@ -39,6 +41,9 @@ This plugin solves a common problem when automating email creation in Mautic: it
    - Navigate to **Settings** (gear icon) -> **Plugins**.
    - Click the **Install/Upgrade Plugins** button.
    - The "MJML API Bundle" should appear in the list.
+   - Enable the bundled **GrapesJS Builder** plugin as well, if it is not already enabled.
+
+Plugin version 2.0.0 targets Mautic 7 only. It registers its services through Symfony autowiring (`Config/services.php`) and uses fully qualified controller routes, which Mautic 7 requires. After upgrading from 1.x, clear the cache and run **Install/Upgrade Plugins** again.
 
 ## 🔌 API Documentation
 
@@ -58,7 +63,7 @@ Create a new email by sending MJML content.
 | `name` | string | **Yes** | Internal name of the email (visible in Mautic UI). |
 | `subject` | string | **Yes** | The email subject line. |
 | `mjml` | string | **Yes** | The raw MJML source code. |
-| `lists` | array | **Yes** | Array of Segment IDs (e.g., `[1, 5]`). |
+| `lists` | array | **Yes** | Array of Segment IDs (e.g., `[1, 5]`). Unknown IDs are skipped. Segments are stored only for `emailType: "list"` (the default). Mautic drops segments when the email type is anything else. |
 | `isPublished` | boolean | No | `true` or `false` (default: `false`). |
 | `publishUp` | string | No | Publish start date/time (ISO 8601 format, e.g., `2025-12-15T10:00:00`). |
 | `publishDown` | string | No | Publish end date/time (ISO 8601 format, e.g., `2025-12-31T23:59:59`). |
@@ -94,6 +99,8 @@ curl -X POST 'https://your-mautic-url.com/api/emails/mjml/new' \
 ```
 
 #### Success Response (201 Created)
+
+The payload is the standard Mautic email API object (serializer groups `emailDetails`, `publishDetails` and `leadListList`), so additional email fields may be present.
 
 ```json
 {
@@ -160,7 +167,7 @@ curl -X PATCH 'https://your-mautic-url.com/api/emails/mjml/150/edit' \
    - If CLI is unavailable, it attempts to run a temporary Node.js script.
    - If compilation fails, it logs the error and returns the original content (fallback).
 3. **Entity Creation**: A new Mautic `Email` entity is created (or updated) with the compiled HTML set as `customHtml`.
-4. **Builder Storage**: The original MJML is saved into the `grapesjs_builder` table. This is the crucial step that allows you to open the email in Mautic's builder later and see the visual blocks instead of raw HTML.
+4. **Builder Storage**: The original MJML is saved into the `bundle_grapesjsbuilder` table (`custom_mjml`). This is the crucial step that allows you to open the email in Mautic's builder later and see the visual blocks instead of raw HTML.
 
 ## 🛠️ Troubleshooting
 
